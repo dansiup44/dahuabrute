@@ -208,8 +208,19 @@ def get_device_info(login_id):
         ptz_buf = (ctypes.c_byte * 256)()
         ptz_ret = ctypes.c_int(0)
         ptz_res = sdk.CLIENT_QueryDevState(C_LLONG(login_id), QUERY_PTZ_LOCATION, ctypes.cast(ptz_buf, ctypes.c_char_p), 256, ctypes.byref(ptz_ret), 2000)
-        ptz = True if ptz_res else False
-        debug_log(f"ID {login_id} - Model: {model} | S:{speaker} M:{mic} P:{ptz}")
+        
+        DH_DEV_PTZ_CFG = 0x0040
+        ptz_cfg_buf = (ctypes.c_byte * 4096)()
+        ret_len = ctypes.c_int(0)
+        ptz_cfg_res = sdk.CLIENT_GetDevConfig(C_LLONG(login_id), DH_DEV_PTZ_CFG, -1, ctypes.byref(ptz_cfg_buf), ctypes.sizeof(ptz_cfg_buf), ctypes.byref(ret_len), 3000)
+        
+        ptz_heuristic = False
+        if model.upper().startswith("SD") or "PTZ" in model.upper() or "DOME" in model.upper():
+            ptz_heuristic = True
+
+        ptz = True if (ptz_res or ptz_cfg_res or ptz_heuristic) else False
+        
+        debug_log(f"ID {login_id} - Model: {model} | S:{speaker} M:{mic} P:{ptz} (L:{bool(ptz_res)} C:{bool(ptz_cfg_res)} H:{ptz_heuristic})")
         return model, speaker, mic, ptz
     except Exception as e:
         debug_log(f"Info retrieval failed for ID {login_id}: {e}")
@@ -243,7 +254,6 @@ def attempt_login(ip, port, user, password, output_dir):
             if m: caps.append("mic")
             capabilities = ":".join(caps) if caps else "NONE"
             
-            # Sanitize filename components
             clean_model = sanitize_filename(model)
             cap_suffix = f"_{capabilities.replace(':', '_')}" if capabilities != "NONE" else ""
             filename = os.path.join(output_dir, f"{ip}_{port}_{user}_{password}_{clean_model}{cap_suffix}.jpg")
@@ -299,7 +309,7 @@ def process_target(ip, port, credentials, output_dir):
             if snap_ok:
                 success = True
                 with stats_lock: stats["found"] += 1
-            break # Password correct, stop trying others even if snap failed
+            break
     with stats_lock: stats["scanned"] += 1
     return success
 
